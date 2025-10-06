@@ -1,6 +1,13 @@
 import json
 import sys
 
+dict_lowercase = {
+    'a': 'A',
+    'b': 'B',
+    'c': 'C',
+    'd': 'D',
+}
+
 def preprocess_dataset(input_file, output_file):
     with open(input_file, 'r') as f:
         data = json.load(f)
@@ -10,7 +17,7 @@ def preprocess_dataset(input_file, output_file):
     for item in data:
         for question_key in item['questions']:
             question = item['questions'][question_key]
-            text = f"{question['text']}\nOptions:\n(A) {question['options']['a']['text']}\n(B) {question['options']['b']['text']}\n(C) {question['options']['c']['text']}\n(D) {question['options']['d']['text']}\nReference Passage: {item['text']}"
+            text = f"{question['text']}\nOptions:\n(A) {question['options']['a']['text']}\n(B) {question['options']['b']['text']}\n(C) {question['options']['c']['text']}\n(D) {question['options']['d']['text']}\nCorrect Answer: {dict_lowercase[question['answer']]}\nReference Passage: {item['text']}"
 
             data_new.append({
                 'processed_text': text,
