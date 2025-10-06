@@ -263,7 +263,7 @@ def main():
         print(f"Split result - Train: {len(train_texts)} samples, Val: {len(val_texts)} samples")
     
     # 加载测试数据
-    test_texts, test_difficulties = load_data(args.test_file)
+    test_texts, test_difficulties = load_data(args.test_file, args.training_target)
     print(f"Loaded test data: {len(test_texts)} samples")
     print("-" * 50)
     
