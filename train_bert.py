@@ -1,4 +1,6 @@
 import json
+import sys
+import datetime
 import torch
 import torch.nn as nn
 from torch.utils.data import Dataset, DataLoader
@@ -11,6 +13,20 @@ import os
 from sklearn.metrics import r2_score
 from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import StandardScaler
+
+# 日志 Tee 实现：将输出同时写到控制台和文件
+class Tee:
+    def __init__(self, *streams):
+        self.streams = streams
+    def write(self, data):
+        for s in self.streams:
+            s.write(data)
+            s.flush()
+    def flush(self):
+        for s in self.streams:
+            s.flush()
+
+_LOG_FH = None  # 保持文件句柄存活，防止被回收
 
 # 1. 自定义数据集类
 class DifficultyDataset(Dataset):
@@ -214,6 +230,8 @@ def parse_args():
                         help='Filename for saving the best model')
     parser.add_argument('--normalize', action='store_true', 
                         help='Apply z-score normalization to difficulty values')
+    parser.add_argument('--log_file', type=str, default=None,
+                        help='Path to log file (default: <output_dir>/train_bert_YYYYMMDD_HHMMSS.log)')
     
     return parser.parse_args()
 
@@ -232,6 +250,16 @@ def main():
     args = parse_args()
     set_seed(args.seed)
     os.makedirs(args.output_dir, exist_ok=True)
+
+    # ========== 日志重定向 ==========
+    timestamp = datetime.datetime.now().strftime('%YMMDD_%H%M%S')
+    default_log = os.path.join(args.output_dir, f'train_bert_{timestamp}.log')
+    log_path = args.log_file if args.log_file is not None else default_log
+    global _LOG_FH
+    _LOG_FH = open(log_path, 'a', encoding='utf-8')
+    sys.stdout = Tee(sys.stdout, _LOG_FH)
+    sys.stderr = Tee(sys.stderr, _LOG_FH)
+    print(f"Logging to {log_path}")
     
     print("=" * 50)
     print("Configuration:")
