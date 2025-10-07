@@ -11,7 +11,6 @@ import os
 from sklearn.metrics import r2_score
 from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import StandardScaler
-from tqdm import tqdm
 
 # 1. 自定义数据集类（适配Decoder-Only模型）
 class DifficultyDataset(Dataset):
@@ -156,7 +155,7 @@ def train_epoch(model, dataloader, optimizer, device, criterion, scheduler=None,
     total_loss = 0
     optimizer.zero_grad()
     
-    for step, batch in enumerate(tqdm(dataloader)):
+    for step, batch in enumerate(dataloader):
         input_ids = batch['input_ids'].to(device)
         attention_mask = batch['attention_mask'].to(device)
         difficulties = batch['difficulty'].to(device)
@@ -419,7 +418,7 @@ def main():
     training_history = []
     
     print("\nStarting training...")
-    for epoch in tqdm(range(args.epochs)):
+    for epoch in range(args.epochs):
         train_loss = train_epoch(model, train_loader, optimizer, device, criterion, 
                                 scheduler=scheduler, accumulation_steps=args.accumulation_steps)
         val_mse, val_mae, val_rmse, val_r2, _, _ = eval_model(model, val_loader, device, criterion, scaler=scaler)
