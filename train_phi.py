@@ -91,11 +91,11 @@ def load_data(file_path, training_target):
 
 # 3. 定义Decoder-Only回归模型（支持LLaMA/Mistral等）
 class DecoderOnlyRegressor(nn.Module):
-    def __init__(self, model_name='meta-llama/Llama-2-7b-chat-hf', dropout=0.3, use_fp16=False, freeze_layers=None):
+    def __init__(self, model_name='meta-llama/Llama-2-7b-chat-hf', dropout=0.3, use_fp16=False, freeze_layers=None, cache_dir='/nfshomes/minglii/scratch/cache/hub'):
         super(DecoderOnlyRegressor, self).__init__()
         self.model_name = model_name
         
-        cache_directory = os.path.expanduser('/nfshomes/minglii/scratch/cache/hub')
+        cache_directory = os.path.expanduser(cache_dir)
         
         # 根据参数选择精度
         dtype = torch.float16 if use_fp16 else torch.float32
@@ -303,6 +303,8 @@ def parse_args():
                         help='Filename for saving the best model')
     parser.add_argument('--normalize', action='store_true', 
                         help='Apply z-score normalization to difficulty values')
+    parser.add_argument('--cache_dir', type=str, default='/nfshomes/minglii/scratch/cache/hub',
+                        help='Cache directory for model downloads (default: /nfshomes/minglii/scratch/cache/hub)')
     parser.add_argument('--log_file', type=str, default=None,
                         help='Path to log file (default: <output_dir>/train_phi_YYYYMMDD_HHMMSS.log)')
     
@@ -417,7 +419,8 @@ def main():
         model_name=args.model_name, 
         dropout=args.dropout,
         use_fp16=args.use_fp16,
-        freeze_layers=args.freeze_layers
+        freeze_layers=args.freeze_layers,
+        cache_dir=args.cache_dir
     ).to(device)
     print(f"Model loaded with {sum(p.numel() for p in model.parameters())/1e6:.2f}M parameters")
     print(f"Trainable parameters: {sum(p.numel() for p in model.parameters() if p.requires_grad)/1e6:.2f}M")

@@ -73,11 +73,11 @@ def load_data(file_path, training_target):
 
 # 3. 定义Transformer回归模型（支持BERT/Longformer等）
 class TransformerRegressor(nn.Module):
-    def __init__(self, model_name='bert-base-uncased', dropout=0.3):
+    def __init__(self, model_name='bert-base-uncased', dropout=0.3, cache_dir='/nfshomes/minglii/scratch/cache/hub'):
         super(TransformerRegressor, self).__init__()
         self.model_name = model_name
         
-        cache_directory = os.path.expanduser('/nfshomes/minglii/scratch/cache/hub')
+        cache_directory = os.path.expanduser(cache_dir)
         
         try:
             self.transformer = AutoModel.from_pretrained(model_name, cache_dir=cache_directory)
@@ -230,6 +230,8 @@ def parse_args():
                         help='Filename for saving the best model')
     parser.add_argument('--normalize', action='store_true', 
                         help='Apply z-score normalization to difficulty values')
+    parser.add_argument('--cache_dir', type=str, default='/nfshomes/minglii/scratch/cache/hub',
+                        help='Cache directory for model downloads (default: /nfshomes/minglii/scratch/cache/hub)')
     parser.add_argument('--log_file', type=str, default=None,
                         help='Path to log file (default: <output_dir>/train_bert_YYYYMMDD_HHMMSS.log)')
     
@@ -337,7 +339,7 @@ def main():
     
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f"Using device: {device}")
-    model = TransformerRegressor(model_name=args.model_name, dropout=args.dropout).to(device)
+    model = TransformerRegressor(model_name=args.model_name, dropout=args.dropout, cache_dir=args.cache_dir).to(device)
     
     optimizer = AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
     criterion = nn.MSELoss()
