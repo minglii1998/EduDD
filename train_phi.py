@@ -328,8 +328,14 @@ def main():
     timestamp = datetime.datetime.now().strftime('%YMMDD_%H%M%S')
     default_log = os.path.join(args.output_dir, f'train_phi_{timestamp}.log')
     log_path = args.log_file if args.log_file is not None else default_log
+    
+    # 如果日志文件已存在，删除它
+    if os.path.exists(log_path):
+        os.remove(log_path)
+        print(f"Removed existing log file: {log_path}")
+    
     global _LOG_FH
-    _LOG_FH = open(log_path, 'a', encoding='utf-8')
+    _LOG_FH = open(log_path, 'w', encoding='utf-8')
     sys.stdout = Tee(sys.stdout, _LOG_FH)
     sys.stderr = Tee(sys.stderr, _LOG_FH)
     print(f"Logging to {log_path}")
