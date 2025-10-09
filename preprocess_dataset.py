@@ -21,7 +21,7 @@ def preprocess_dataset(input_file, output_file):
             if question['text'] == '':
                 continue
             
-            text = f"{question['text']}\nOptions:\n(A) {question['options']['a']['text']}\n(B) {question['options']['b']['text']}\n(C) {question['options']['c']['text']}\n(D) {question['options']['d']['text']}\nCorrect Answer: {dict_lowercase[question['answer']]}\nReference Passage: {item['text']}"
+            text = f"Reading Comprehension Question: {question['text']}\nOptions:\n(A) {question['options']['a']['text']}\n(B) {question['options']['b']['text']}\n(C) {question['options']['c']['text']}\n(D) {question['options']['d']['text']}\nCorrect Answer: ({dict_lowercase[question['answer']]}) {question['options'][question['answer']]['text']}\nReference Passage: {item['text']}\nCommon European Framework of Reference for Languages (CEFR) Level: {item['level']}"
 
             data_new.append({
                 'processed_text': text,
@@ -37,5 +37,5 @@ def preprocess_dataset(input_file, output_file):
         json.dump(data_new, f, indent=4, ensure_ascii=False)
 
 if __name__ == "__main__":
-    preprocess_dataset('Cambridge_mcq_test_pub.json', 'Cambridge_mcq_test_pub_Processed.json')
-    preprocess_dataset('Cambridge_mcq_train_pub.json', 'Cambridge_mcq_train_pub_Processed.json')
+    preprocess_dataset('split_pub/Cambridge_mcq_test_pub.json', 'split_pub/Cambridge_mcq_test_pub_Processed.json')
+    preprocess_dataset('split_pub/Cambridge_mcq_train_pub.json', 'split_pub/Cambridge_mcq_train_pub_Processed.json')

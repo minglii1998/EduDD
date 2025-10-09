@@ -263,7 +263,7 @@ def parse_args():
                         default=None,
                         help='System prompt for chat template')
     parser.add_argument('--prefix_prompt', type=str, 
-                        default='Predict the difficulty score of the following question.\n',
+                        default='',
                         help='Prefix prompt for chat template')
 
     # 模型相关参数
