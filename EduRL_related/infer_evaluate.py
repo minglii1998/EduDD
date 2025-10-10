@@ -233,7 +233,7 @@ def main():
     
     # Perform inference
     print("Starting inference...")
-    predictions = []
+    results_data = []
     
     for i, text in enumerate(tqdm(processed_texts, desc="Processing")):
         try:
@@ -243,24 +243,49 @@ def main():
             # Extract boxed value
             boxed_value = extract_boxed_value(response)
             
+            # Create result dictionary for this sample
+            sample_result = {
+                "sample_id": i + 1,
+                "processed_text": text,
+                "model_response": response,
+                "extracted_value": boxed_value,
+                "predicted_difficulty": boxed_value * 10 if boxed_value is not None else None,
+                "ground_truth_difficulty": difficulties[i],
+                "extraction_success": boxed_value is not None
+            }
+            
+            results_data.append(sample_result)
+            
             if boxed_value is not None:
-                # Multiply by 10 as requested
                 predicted_difficulty = boxed_value * 10
-                predictions.append(predicted_difficulty)
                 print(f"Sample {i+1}: Predicted {predicted_difficulty:.2f}, Ground truth {difficulties[i]:.2f}")
             else:
-                predictions.append(None)
                 print(f"Sample {i+1}: No valid prediction found in response")
                 
         except Exception as e:
             print(f"Error processing sample {i+1}: {e}")
-            predictions.append(None)
+            # Create error result dictionary
+            sample_result = {
+                "sample_id": i + 1,
+                "processed_text": text,
+                "model_response": None,
+                "extracted_value": None,
+                "predicted_difficulty": None,
+                "ground_truth_difficulty": difficulties[i],
+                "extraction_success": False,
+                "error": str(e)
+            }
+            results_data.append(sample_result)
 
         pass
     
+    # Extract predictions and ground truth for evaluation
+    predictions = [item["predicted_difficulty"] for item in results_data]
+    ground_truth = [item["ground_truth_difficulty"] for item in results_data]
+    
     # Evaluate results
     print("\nEvaluating results...")
-    results = evaluate_predictions(predictions, difficulties)
+    results = evaluate_predictions(predictions, ground_truth)
     
     if results:
         print(f"\nEvaluation Results:")
@@ -270,14 +295,28 @@ def main():
         print(f"R²: {results['R2']:.4f}")
         print(f"Valid samples: {results['valid_samples']}/{results['total_samples']}")
         
+        # Print summary
+        successful_extractions = sum(1 for item in results_data if item['extraction_success'])
+        failed_extractions = len(results_data) - successful_extractions
+        success_rate = successful_extractions / len(results_data) * 100
+        
+        print(f"\nExtraction Summary:")
+        print(f"Successful extractions: {successful_extractions}/{len(results_data)} ({success_rate:.1f}%)")
+        print(f"Failed extractions: {failed_extractions}/{len(results_data)} ({100-success_rate:.1f}%)")
+        
         # Save results
         output_data = {
             'model_name': args.model_name,
             'data_path': args.data_path,
             'system_prompt': args.system_prompt,
-            'metrics': results,
-            'predictions': predictions,
-            'ground_truth': difficulties
+            'evaluation_metrics': results,
+            'sample_results': results_data,
+            'summary': {
+                'total_samples': len(results_data),
+                'successful_extractions': sum(1 for item in results_data if item['extraction_success']),
+                'failed_extractions': sum(1 for item in results_data if not item['extraction_success']),
+                'success_rate': sum(1 for item in results_data if item['extraction_success']) / len(results_data) * 100
+            }
         }
         
         with open(args.output_file, 'w', encoding='utf-8') as f:
