@@ -28,6 +28,60 @@ class Tee:
 
 _LOG_FH = None  # 保持文件句柄存活，防止被回收
 
+# ========== 新增：Scalar Mix Layer ==========
+class ScalarMix(nn.Module):
+    """
+    Scalar Mix Layer: 对所有层的hidden states进行加权融合
+    参考论文: "Deep Contextualized Word Representations" (Peters et al., 2018)
+    
+    注意：即使某些层被冻结，scalar weights 仍然是可学习的
+    因为我们是在学习"如何组合"已有的表示，而不是改变表示本身
+    """
+    def __init__(self, num_layers, trainable=True, use_gamma=True):
+        super(ScalarMix, self).__init__()
+        self.num_layers = num_layers
+        self.trainable = trainable
+        self.use_gamma = use_gamma
+        
+        # 为每一层创建一个可学习的标量权重
+        if trainable:
+            # 初始化为均匀权重（经过log后）
+            self.scalar_weights = nn.Parameter(torch.zeros(num_layers))
+        else:
+            # 如果不可训练，使用均匀权重
+            self.register_buffer('scalar_weights', torch.zeros(num_layers))
+        
+        # Gamma参数用于缩放混合后的表示（可选）
+        if use_gamma:
+            if trainable:
+                self.gamma = nn.Parameter(torch.tensor(1.0))
+            else:
+                self.register_buffer('gamma', torch.tensor(1.0))
+        else:
+            self.gamma = 1.0
+    
+    def forward(self, hidden_states_list):
+        """
+        Args:
+            hidden_states_list: List of tensors, each of shape [batch_size, seq_len, hidden_size]
+                               长度为 num_layers
+        
+        Returns:
+            mixed_hidden_states: Tensor of shape [batch_size, seq_len, hidden_size]
+            weights: Tensor of shape [num_layers] - softmax normalized weights
+        """
+        if len(hidden_states_list) != self.num_layers:
+            raise ValueError(f"Expected {self.num_layers} hidden states, got {len(hidden_states_list)}")
+
+        weights = torch.softmax(self.scalar_weights, dim=0)     # [L]
+        mixed = None
+        for i, hs in enumerate(hidden_states_list):             # 每个 hs: [B,T,H]
+            term = hs * weights[i]
+            mixed = term if mixed is None else (mixed + term)   # 累加，避免stack
+        mixed = (self.gamma * mixed) if not isinstance(self.gamma, float) else (self.gamma * mixed)
+
+        return mixed, weights
+
 # 1. 自定义数据集类（适配Decoder-Only模型）
 class DifficultyDataset(Dataset):
     def __init__(self, texts, difficulties, tokenizer, max_length=512, system_prompt=None, prefix_prompt=''):
@@ -89,11 +143,19 @@ def load_data(file_path, training_target):
     
     return texts, difficulties
 
-# 3. 定义Decoder-Only回归模型（支持LLaMA/Mistral等）
+# 3. 定义Decoder-Only回归模型（支持LLaMA/Mistral等）+ Scalar Mix
 class DecoderOnlyRegressor(nn.Module):
-    def __init__(self, model_name='meta-llama/Llama-2-7b-chat-hf', dropout=0.3, use_fp16=False, freeze_layers=None, cache_dir='/nfshomes/minglii/scratch/cache/hub'):
+    def __init__(self, model_name='meta-llama/Llama-2-7b-chat-hf', dropout=0.3, use_fp16=False, 
+                 freeze_layers=None, pooling_method='last', cache_dir='/nfshomes/minglii/scratch/cache/hub',
+                 use_scalar_mix=False, scalar_mix_layer_indices=None,
+                 scalar_mix_trainable=True, scalar_mix_use_gamma=True):
         super(DecoderOnlyRegressor, self).__init__()
         self.model_name = model_name
+        self.pooling_method = pooling_method  # 'last' or 'mean'
+        self.use_scalar_mix = use_scalar_mix
+        
+        if pooling_method not in ['last', 'mean']:
+            raise ValueError(f"pooling_method must be 'last' or 'mean', got '{pooling_method}'")
         
         cache_directory = os.path.expanduser(cache_dir)
         
@@ -118,9 +180,48 @@ class DecoderOnlyRegressor(nn.Module):
                 device_map=None
             )
         
+        # 冻结LM head（我们不会使用它，只需要hidden states）
+        if hasattr(self.model, 'lm_head'):
+            for param in self.model.lm_head.parameters():
+                param.requires_grad = False
+        
+        # 获取模型层数（不包括embedding层）
+        self.num_transformer_layers = len(self.model.model.layers)
+        
         # 冻结大部分层（如果指定）
+        self.frozen_layer_indices = set()
         if freeze_layers is not None:
             self._freeze_layers(num_layers_to_train=freeze_layers)
+        
+        # ========== Scalar Mix配置 ==========
+        if use_scalar_mix:
+            # 确定要使用哪些层
+            if scalar_mix_layer_indices is not None:
+                # 用户指定了要使用的层索引
+                self.scalar_mix_layer_indices = scalar_mix_layer_indices
+            else:
+                # 默认使用所有transformer层（不包括embedding层）
+                # 索引从0开始，0表示第一个transformer层的输出
+                self.scalar_mix_layer_indices = list(range(self.num_transformer_layers))
+            
+            num_layers_for_mix = len(self.scalar_mix_layer_indices)
+            
+            # 创建Scalar Mix层
+            # 重要：即使某些层被冻结，scalar mix的权重仍然可以训练
+            # 因为我们是在学习"如何组合"已有的表示，而不是改变表示本身
+            self.scalar_mix = ScalarMix(
+                num_layers=num_layers_for_mix,
+                trainable=scalar_mix_trainable,
+                use_gamma=scalar_mix_use_gamma
+            )
+            
+            print(f"\n{'='*50}")
+            print(f"Scalar Mix Configuration:")
+            print(f"  Using {num_layers_for_mix} layers: {self.scalar_mix_layer_indices}")
+            print(f"  Frozen transformer layers: {sorted(self.frozen_layer_indices) if self.frozen_layer_indices else 'None'}")
+            print(f"  Scalar Mix trainable: {scalar_mix_trainable}")
+            print(f"  Use gamma scaling: {scalar_mix_use_gamma}")
+            print(f"{'='*50}\n")
         
         self.dropout = nn.Dropout(dropout)
         self.regressor = nn.Linear(self.model.config.hidden_size, 1)
@@ -132,38 +233,88 @@ class DecoderOnlyRegressor(nn.Module):
             param.requires_grad = False
         
         # 冻结前面的transformer层
-        total_layers = len(self.model.model.layers)
+        total_layers = self.num_transformer_layers
         for i, layer in enumerate(self.model.model.layers):
             if i < total_layers - num_layers_to_train:
                 for param in layer.parameters():
                     param.requires_grad = False
+                self.frozen_layer_indices.add(i)
         
         print(f"Frozen all but last {num_layers_to_train} layers")
+        print(f"Frozen layer indices: {sorted(self.frozen_layer_indices)}")
     
     def forward(self, input_ids, attention_mask):
-        # 获取模型输出
+        # 获取模型输出，包括所有层的hidden states
         outputs = self.model(
             input_ids=input_ids,
             attention_mask=attention_mask,
             output_hidden_states=True
         )
         
-        # 获取最后一层的hidden states
-        hidden_states = outputs.hidden_states[-1]  # [batch_size, seq_len, hidden_size]
+        # outputs.hidden_states是一个tuple，包含:
+        # - hidden_states[0]: embedding层的输出
+        # - hidden_states[1:]: 每个transformer层的输出
+        # 总共有 num_transformer_layers + 1 个元素
         
-        # 找到每个样本中最后一个非padding token的位置
-        # attention_mask: [batch_size, seq_len], 1表示真实token，0表示padding
-        sequence_lengths = attention_mask.sum(dim=1) - 1  # [batch_size]
+        if self.use_scalar_mix:
+            # 提取指定层的hidden states
+            selected_hidden_states = [
+                outputs.hidden_states[idx + 1]  # +1因为索引0是embedding层
+                for idx in self.scalar_mix_layer_indices
+            ]
+            
+            # 使用Scalar Mix融合
+            mixed_hidden_states, layer_weights = self.scalar_mix(selected_hidden_states)
+            # mixed_hidden_states: [batch_size, seq_len, hidden_size]
+            
+            # 保存权重用于分析（可选）- 立即detach并移到CPU
+            self.last_layer_weights = layer_weights.detach().cpu()
+            
+            # 使用融合后的hidden states
+            hidden_states = mixed_hidden_states
+            
+            # 清理不需要的hidden states以释放内存
+            del selected_hidden_states, outputs.hidden_states
+        else:
+            # 原始方式：只使用最后一层的hidden states
+            hidden_states = outputs.hidden_states[-1]
+            # 清理不需要的hidden states
+            del outputs.hidden_states
         
-        # 提取最后一个token的hidden state
-        batch_size = hidden_states.shape[0]
-        last_hidden_states = hidden_states[torch.arange(batch_size), sequence_lengths]  # [batch_size, hidden_size]
+        # Pooling操作
+        if self.pooling_method == 'last':
+            # 找到每个样本中最后一个非padding token的位置
+            sequence_lengths = attention_mask.sum(dim=1) - 1  # [batch_size]
+            batch_size = hidden_states.shape[0]
+            pooled_output = hidden_states[torch.arange(batch_size), sequence_lengths]
+        
+        # elif self.pooling_method == 'mean':
+        #     # Mean pooling
+        #     attention_mask_expanded = attention_mask.unsqueeze(-1).expand(hidden_states.size()).float()
+        #     sum_hidden_states = torch.sum(hidden_states * attention_mask_expanded, dim=1)
+        #     sum_mask = attention_mask_expanded.sum(dim=1)
+        #     sum_mask = torch.clamp(sum_mask, min=1e-9)
+        #     pooled_output = sum_hidden_states / sum_mask
+
+        elif self.pooling_method == 'mean':
+            # Mean pooling
+            mask = attention_mask.unsqueeze(-1).float()       # [B, T, 1]
+            summed = (hidden_states * mask).sum(dim=1)         # [B, H]
+            counts = mask.sum(dim=1).clamp(min=1e-9)           # [B, 1]
+            pooled_output = summed / counts                    # [B, H]
+
         
         # 应用dropout和回归层
-        output = self.dropout(last_hidden_states)
+        output = self.dropout(pooled_output)
         output = self.regressor(output)
         
         return output.squeeze(-1)
+    
+    def get_layer_weights(self):
+        """获取Scalar Mix的层权重（用于分析）"""
+        if self.use_scalar_mix and hasattr(self, 'last_layer_weights'):
+            return self.last_layer_weights.numpy()
+        return None
 
 # 4. 训练函数
 def train_epoch(model, dataloader, optimizer, device, criterion, scheduler=None, accumulation_steps=1):
@@ -171,6 +322,7 @@ def train_epoch(model, dataloader, optimizer, device, criterion, scheduler=None,
     total_loss = 0
     optimizer.zero_grad()
     
+    print(f"  Training on {len(dataloader)} batches...")
     for step, batch in enumerate(dataloader):
         input_ids = batch['input_ids'].to(device)
         attention_mask = batch['attention_mask'].to(device)
@@ -191,18 +343,29 @@ def train_epoch(model, dataloader, optimizer, device, criterion, scheduler=None,
                 scheduler.step()
             
             optimizer.zero_grad()
+            
+            # 定期清理GPU缓存
+            if (step + 1) % (accumulation_steps * 10) == 0 and torch.cuda.is_available():
+                torch.cuda.empty_cache()
         
         total_loss += loss.item() * accumulation_steps
+        
+        # # 每10个batch打印一次进度
+        # if (step + 1) % 10 == 0:
+        #     print(f"    Batch {step+1}/{len(dataloader)}, Loss: {loss.item():.4f}")
     
+    print(f"  Training completed. Average loss: {total_loss / len(dataloader):.4f}")
     return total_loss / len(dataloader)
 
 # 5. 评估函数
-def eval_model(model, dataloader, device, criterion, scaler=None):
+def eval_model(model, dataloader, device, criterion, scaler=None, return_layer_weights=False):
     """评估模型"""
     model.eval()
     predictions_list = []
     actuals_list = []
+    layer_weights_list = []
     
+    print(f"  Evaluating on {len(dataloader)} batches...")
     with torch.no_grad():
         for batch in dataloader:
             input_ids = batch['input_ids'].to(device)
@@ -214,6 +377,12 @@ def eval_model(model, dataloader, device, criterion, scaler=None):
             predictions_np = predictions.cpu().numpy()
             predictions_list.extend(np.atleast_1d(predictions_np))
             actuals_list.extend(np.atleast_1d(difficulties.cpu().numpy()))
+            
+            # 收集layer weights
+            if return_layer_weights and model.use_scalar_mix:
+                weights = model.get_layer_weights()
+                if weights is not None:
+                    layer_weights_list.append(weights)
     
     predictions_array = np.array(predictions_list)
     actuals_array = np.array(actuals_list)
@@ -223,7 +392,6 @@ def eval_model(model, dataloader, device, criterion, scaler=None):
         print("Warning: Found NaN or Inf in predictions!")
         print(f"  NaN count: {np.sum(np.isnan(predictions_array))}")
         print(f"  Inf count: {np.sum(np.isinf(predictions_array))}")
-        # 用均值替换NaN和Inf
         valid_mask = ~(np.isnan(predictions_array) | np.isinf(predictions_array))
         if np.any(valid_mask):
             mean_val = np.mean(predictions_array[valid_mask])
@@ -242,11 +410,18 @@ def eval_model(model, dataloader, device, criterion, scaler=None):
     rmse = np.sqrt(mse)
     r2 = r2_score(actuals_array, predictions_array)
     
-    return mse, mae, rmse, r2, predictions_array.tolist(), actuals_array.tolist()
+    result = (mse, mae, rmse, r2, predictions_array.tolist(), actuals_array.tolist())
+    
+    if return_layer_weights and len(layer_weights_list) > 0:
+        # 平均所有batch的layer weights
+        avg_layer_weights = np.mean(layer_weights_list, axis=0)
+        return result + (avg_layer_weights,)
+    
+    return result
 
 # 6. 参数解析
 def parse_args():
-    parser = argparse.ArgumentParser(description='Decoder-Only Model Difficulty Regression Training')
+    parser = argparse.ArgumentParser(description='Decoder-Only Model Difficulty Regression Training with Scalar Mix')
     
     # 数据相关参数
     parser.add_argument('--train_file', type=str, default='Cambridge_train.json', 
@@ -273,6 +448,23 @@ def parse_args():
                         help='Maximum sequence length')
     parser.add_argument('--dropout', type=float, default=0.3, 
                         help='Dropout rate')
+    parser.add_argument('--pooling_method', type=str, default='last', choices=['last', 'mean'],
+                        help='Pooling method for hidden states: "last" (last token) or "mean" (mean pooling)')
+    
+    # ========== 新增：Scalar Mix参数 ==========
+    parser.add_argument('--use_scalar_mix', action='store_true',
+                        help='Use Scalar Mix to combine hidden states from multiple layers')
+    parser.add_argument('--scalar_mix_layers', type=str, default=None,
+                        help='Comma-separated layer indices to use for Scalar Mix (e.g., "0,5,10,15"). '
+                             'If not specified, all layers will be used.')
+    parser.add_argument('--scalar_mix_trainable', action='store_true', default=True,
+                        help='Whether scalar mix weights are trainable (default: True)')
+    parser.add_argument('--scalar_mix_use_gamma', action='store_true', default=True,
+                        help='Whether to use gamma scaling parameter in scalar mix (default: True)')
+    parser.add_argument('--no_scalar_mix_trainable', dest='scalar_mix_trainable', action='store_false',
+                        help='Disable training of scalar mix weights')
+    parser.add_argument('--no_scalar_mix_gamma', dest='scalar_mix_use_gamma', action='store_false',
+                        help='Disable gamma scaling in scalar mix')
     
     # 训练相关参数
     parser.add_argument('--batch_size', type=int, default=2, 
@@ -326,12 +518,17 @@ def main():
     set_seed(args.seed)
     os.makedirs(args.output_dir, exist_ok=True)
     
+    # 解析scalar_mix_layers参数
+    scalar_mix_layer_indices = None
+    if args.scalar_mix_layers is not None:
+        scalar_mix_layer_indices = [int(x.strip()) for x in args.scalar_mix_layers.split(',')]
+        print(f"Using specified layers for Scalar Mix: {scalar_mix_layer_indices}")
+    
     # ========== 日志重定向 ==========
-    timestamp = datetime.datetime.now().strftime('%YMMDD_%H%M%S')
+    timestamp = datetime.datetime.now().strftime('%Y%m%d_%H%M%S')
     default_log = os.path.join(args.output_dir, f'train_phi_{timestamp}.log')
     log_path = args.log_file if args.log_file is not None else default_log
     
-    # 如果日志文件已存在，删除它
     if os.path.exists(log_path):
         os.remove(log_path)
         print(f"Removed existing log file: {log_path}")
@@ -395,7 +592,6 @@ def main():
     print(f"\nLoading tokenizer: {args.model_name}")
     tokenizer = AutoTokenizer.from_pretrained(args.model_name)
     
-    # 为decoder-only模型设置pad token
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
         print(f"Set pad_token to eos_token: {tokenizer.eos_token}")
@@ -407,9 +603,9 @@ def main():
     test_dataset = DifficultyDataset(test_texts, test_difficulties, tokenizer, 
                                     args.max_length, args.system_prompt, args.prefix_prompt)
     
-    train_loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True)
-    val_loader = DataLoader(val_dataset, batch_size=args.batch_size, shuffle=False)
-    test_loader = DataLoader(test_dataset, batch_size=args.batch_size, shuffle=False)
+    train_loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True, num_workers=0, pin_memory=False)
+    val_loader = DataLoader(val_dataset, batch_size=args.batch_size, shuffle=False, num_workers=0, pin_memory=False)
+    test_loader = DataLoader(test_dataset, batch_size=args.batch_size, shuffle=False, num_workers=0, pin_memory=False)
     
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f"Using device: {device}")
@@ -420,10 +616,18 @@ def main():
         dropout=args.dropout,
         use_fp16=args.use_fp16,
         freeze_layers=args.freeze_layers,
-        cache_dir=args.cache_dir
+        pooling_method=args.pooling_method,
+        cache_dir=args.cache_dir,
+        use_scalar_mix=args.use_scalar_mix,
+        scalar_mix_layer_indices=scalar_mix_layer_indices,
+        scalar_mix_trainable=args.scalar_mix_trainable,
+        scalar_mix_use_gamma=args.scalar_mix_use_gamma
     ).to(device)
+    
     print(f"Model loaded with {sum(p.numel() for p in model.parameters())/1e6:.2f}M parameters")
     print(f"Trainable parameters: {sum(p.numel() for p in model.parameters() if p.requires_grad)/1e6:.2f}M")
+    print(f"Pooling method: {args.pooling_method}")
+    print(f"Scalar Mix enabled: {args.use_scalar_mix}")
     if args.use_fp16:
         print("⚠️  Using FP16 - watch for NaN values during training")
     
@@ -456,13 +660,26 @@ def main():
     
     print("\nStarting training...")
     for epoch in range(args.epochs):
+        print(f"\n=== Starting Epoch {epoch+1}/{args.epochs} ===")
         train_loss = train_epoch(model, train_loader, optimizer, device, criterion, 
                                 scheduler=scheduler, accumulation_steps=args.accumulation_steps)
-        val_mse, val_mae, val_rmse, val_r2, _, _ = eval_model(model, val_loader, device, criterion, scaler=scaler)
+        
+        # 评估时收集layer weights
+        eval_result = eval_model(model, val_loader, device, criterion, scaler=scaler, 
+                                return_layer_weights=args.use_scalar_mix)
+        
+        if args.use_scalar_mix and len(eval_result) == 7:
+            val_mse, val_mae, val_rmse, val_r2, _, _, layer_weights = eval_result
+            # 打印layer weights
+            print(f'\nEpoch {epoch+1}/{args.epochs} - Layer Weights:')
+            for i, (layer_idx, weight) in enumerate(zip(model.scalar_mix_layer_indices, layer_weights)):
+                print(f'  Layer {layer_idx}: {weight:.4f}')
+        else:
+            val_mse, val_mae, val_rmse, val_r2, _, _ = eval_result
         
         current_lr = scheduler.get_last_lr()[0]
         
-        print(f'Epoch {epoch+1}/{args.epochs}')
+        print(f'\nEpoch {epoch+1}/{args.epochs}')
         print(f'  Train Loss: {train_loss:.4f}, LR: {current_lr:.2e}')
         if args.normalize:
             print(f'  Val MSE: {val_mse:.4f}, Val MAE: {val_mae:.4f}, Val RMSE: {val_rmse:.4f}, Val R²: {val_r2:.4f} (original scale)')
@@ -481,16 +698,48 @@ def main():
         if val_mse < best_val_loss:
             best_val_loss = val_mse
             model_path = os.path.join(args.output_dir, args.save_model)
+            
+            # 清理GPU缓存并强制垃圾回收
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+            import gc
+            gc.collect()
+            
+            # 保存模型
             torch.save(model.state_dict(), model_path)
             print(f'  ✓ Best model saved to {model_path}!')
+            
+            # 再次清理缓存
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+            gc.collect()
         print('-' * 50)
     
     print('\nEvaluating on test set...')
     model_path = os.path.join(args.output_dir, args.save_model)
+    
+    # 清理GPU缓存
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+    import gc
+    gc.collect()
+    
     model.load_state_dict(torch.load(model_path, map_location=device))
-    test_mse, test_mae, test_rmse, test_r2, test_predictions, test_actuals = eval_model(
-        model, test_loader, device, criterion, scaler=scaler
-    )
+    
+    # 测试时也收集layer weights
+    test_result = eval_model(model, test_loader, device, criterion, scaler=scaler, 
+                            return_layer_weights=args.use_scalar_mix)
+    
+    if args.use_scalar_mix and len(test_result) == 7:
+        test_mse, test_mae, test_rmse, test_r2, test_predictions, test_actuals, test_layer_weights = test_result
+        
+        print(f'\nFinal Layer Weights on Test Set:')
+        for i, (layer_idx, weight) in enumerate(zip(model.scalar_mix_layer_indices, test_layer_weights)):
+            print(f'  Layer {layer_idx}: {weight:.4f}')
+        print()
+    else:
+        test_mse, test_mae, test_rmse, test_r2, test_predictions, test_actuals = test_result
+        test_layer_weights = None
     
     if args.normalize:
         print(f'Test MSE: {test_mse:.4f} (original scale)')
@@ -510,6 +759,8 @@ def main():
         'test_r2': float(test_r2),
         'best_val_loss': float(best_val_loss),
         'normalized': args.normalize,
+        'pooling_method': args.pooling_method,
+        'use_scalar_mix': args.use_scalar_mix,
         'training_history': training_history,
         'predictions': [float(p) for p in test_predictions],
         'actuals': [float(a) for a in test_actuals]
@@ -518,6 +769,13 @@ def main():
     if args.normalize:
         results['scaler_mean'] = float(scaler.mean_[0])
         results['scaler_std'] = float(scaler.scale_[0])
+    
+    if args.use_scalar_mix and test_layer_weights is not None:
+        results['scalar_mix_layer_indices'] = model.scalar_mix_layer_indices
+        results['final_layer_weights'] = {
+            f'layer_{idx}': float(weight) 
+            for idx, weight in zip(model.scalar_mix_layer_indices, test_layer_weights)
+        }
     
     results_path = os.path.join(args.output_dir, 'test_results.json')
     with open(results_path, 'w') as f:
@@ -529,6 +787,10 @@ def main():
         print(f'  Sample {i+1}: Predicted={test_predictions[i]:.4f}, Actual={test_actuals[i]:.4f}')
     
     print('\nTraining completed!')
+    
+    # 关闭日志文件
+    if _LOG_FH is not None:
+        _LOG_FH.close()
 
 if __name__ == '__main__':
     main()
