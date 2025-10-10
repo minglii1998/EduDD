@@ -163,3 +163,6 @@ workspace*
 scripts*
 output*
 logs*
+
+EduRL_related/verl_edu_checkpoint*
+EduRL_related/*.sh
