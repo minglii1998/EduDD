@@ -166,3 +166,6 @@ logs*
 
 EduRL_related/verl_edu_checkpoint*
 EduRL_related/*.sh
+EduAgent_related/model_results/*
+
+try_*.json
