@@ -140,12 +140,13 @@ class MultiInputTransformerRegressor(nn.Module):
         
         return output.squeeze(-1)
 
-# 4. 训练函数
-def train_epoch(model, dataloader, optimizer, device, criterion, scheduler=None):
+# 4. 训练函数 (添加梯度累积)
+def train_epoch(model, dataloader, optimizer, device, criterion, scheduler=None, accumulation_steps=1):
     model.train()
     total_loss = 0
+    optimizer.zero_grad()
     
-    for batch in dataloader:
+    for batch_idx, batch in enumerate(dataloader):
         input_ids = batch['input_ids'].to(device)
         attention_mask = batch['attention_mask'].to(device)
         difficulties = batch['difficulty'].to(device)
@@ -153,16 +154,22 @@ def train_epoch(model, dataloader, optimizer, device, criterion, scheduler=None)
         predictions = model(input_ids, attention_mask)
         loss = criterion(predictions, difficulties)
         
-        optimizer.zero_grad()
+        # 将loss除以累积步数，使得累积后的梯度与原始batch size相当
+        loss = loss / accumulation_steps
         loss.backward()
-        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
         
-        optimizer.step()
+        # 每accumulation_steps步或最后一个batch时更新参数
+        if (batch_idx + 1) % accumulation_steps == 0 or (batch_idx + 1) == len(dataloader):
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            optimizer.step()
+            
+            if scheduler is not None:
+                scheduler.step()
+            
+            optimizer.zero_grad()
         
-        if scheduler is not None:
-            scheduler.step()
-        
-        total_loss += loss.item()
+        # 记录未缩放的loss用于监控
+        total_loss += loss.item() * accumulation_steps
     
     return total_loss / len(dataloader)
 
@@ -212,6 +219,7 @@ def parse_args():
     parser.add_argument('--dropout', type=float, default=0.3)
     parser.add_argument('--attention_heads', type=int, default=8, help='Number of heads in the self-attention layer for answers')
     parser.add_argument('--batch_size', type=int, default=8)
+    parser.add_argument('--accumulation_steps', type=int, default=1, help='Number of gradient accumulation steps. Effective batch size = batch_size * accumulation_steps')
     parser.add_argument('--epochs', type=int, default=5)
     parser.add_argument('--lr', type=float, default=2e-5)
     parser.add_argument('--weight_decay', type=float, default=0.01)
@@ -260,6 +268,10 @@ def main():
     for arg, value in vars(args).items():
         print(f"  {arg}: {value}")
     print("=" * 50)
+    
+    # 计算有效batch size
+    effective_batch_size = args.batch_size * args.accumulation_steps
+    print(f"\nEffective batch size: {args.batch_size} × {args.accumulation_steps} = {effective_batch_size}")
     
     print("\nLoading data...")
     train_questions, train_answers, train_difficulties = load_data(args.train_file, args.training_target, args.answer_keys)
@@ -317,11 +329,13 @@ def main():
     optimizer = AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
     criterion = nn.MSELoss()
     
-    total_steps = len(train_loader) * args.epochs
+    # 计算总步数时考虑梯度累积
+    total_steps = len(train_loader) * args.epochs // args.accumulation_steps
     warmup_steps = int(total_steps * args.warmup_ratio) if args.warmup_steps is None else args.warmup_steps
     scheduler = get_linear_schedule_with_warmup(optimizer, num_warmup_steps=warmup_steps, num_training_steps=total_steps)
     
-    print(f"\nScheduler: {total_steps} total steps, {warmup_steps} warmup steps.")
+    print(f"\nScheduler: {total_steps} total optimization steps, {warmup_steps} warmup steps.")
+    print(f"Note: Total steps adjusted for gradient accumulation (original batches: {len(train_loader) * args.epochs})")
     print("-" * 50)
     
     best_val_loss = float('inf')
@@ -329,14 +343,12 @@ def main():
     
     print("\nStarting training...")
     for epoch in range(args.epochs):
-        train_loss = train_epoch(model, train_loader, optimizer, device, criterion, scheduler)
+        train_loss = train_epoch(model, train_loader, optimizer, device, criterion, scheduler, args.accumulation_steps)
         val_mse, val_mae, val_rmse, val_r2, _, _ = eval_model(model, val_loader, device, criterion, scaler=scaler)
         current_lr = scheduler.get_last_lr()[0]
         
-        # MODIFIED: Added val_rmse and val_mae to the print statement for more detailed logging per epoch.
         print(f'Epoch {epoch+1}/{args.epochs} | Train Loss: {train_loss:.4f} | Val MSE: {val_mse:.4f} | Val MAE: {val_mae:.4f} | Val RMSE: {val_rmse:.4f} | Val R²: {val_r2:.4f} | LR: {current_lr:.2e}')
         
-        # MODIFIED: Explicitly cast all metric values to standard Python float to prevent JSON serialization errors.
         training_history.append({
             'epoch': epoch + 1,
             'train_loss': float(train_loss),
@@ -360,8 +372,6 @@ def main():
     print(f'Test Results (original scale):')
     print(f'  MSE: {test_mse:.4f}, MAE: {test_mae:.4f}, RMSE: {test_rmse:.4f}, R²: {test_r2:.4f}')
     
-    # MODIFIED: Explicitly cast all final metric values to float before creating the results dictionary.
-    # This is the primary fix for the TypeError.
     results = {
         'test_mse': float(test_mse),
         'test_mae': float(test_mae),
@@ -369,12 +379,13 @@ def main():
         'test_r2': float(test_r2),
         'best_val_loss': float(best_val_loss),
         'normalized': args.normalize,
+        'effective_batch_size': effective_batch_size,
+        'accumulation_steps': args.accumulation_steps,
         'training_history': training_history,
-        'predictions': [float(p) for p in test_predictions], # Ensures list elements are native floats
-        'actuals': [float(a) for a in test_actuals]       # Ensures list elements are native floats
+        'predictions': [float(p) for p in test_predictions],
+        'actuals': [float(a) for a in test_actuals]
     }
     if args.normalize:
-        # MODIFIED: Cast scaler attributes to float as well, just in case.
         results['scaler_mean'] = float(scaler.mean_[0])
         results['scaler_std'] = float(scaler.scale_[0])
     
