@@ -4,7 +4,7 @@ import datetime
 import torch
 import torch.nn as nn
 from torch.utils.data import Dataset, DataLoader
-from transformers import AutoTokenizer, AutoModel
+from transformers import AutoTokenizer, AutoModelForCausalLM
 from torch.optim import AdamW
 from transformers import get_linear_schedule_with_warmup
 import numpy as np
@@ -28,12 +28,15 @@ class Tee:
 
 _LOG_FH = None
 
-# 1. 自定义数据集类 (Data Augmentation版本)
+# 1. 自定义数据集类 (Data Augmentation版本 - 适配decoder-only模型)
 class AugmentedDataset(Dataset):
-    def __init__(self, questions, answers_list, difficulties, tokenizer, max_length=512, question_ids=None):
+    def __init__(self, questions, answers_list, difficulties, tokenizer, max_length=512, 
+                 question_ids=None, system_prompt=None, prefix_prompt=None):
         """
         将数据展开：每个(question, answer)对作为一个样本
         question_ids用于在评估时识别哪些样本属于同一个问题
+        system_prompt: 系统提示词
+        prefix_prompt: 在用户内容之前添加的前缀
         """
         self.samples = []
         self.question_ids = []
@@ -58,6 +61,8 @@ class AugmentedDataset(Dataset):
         
         self.tokenizer = tokenizer
         self.max_length = max_length
+        self.system_prompt = system_prompt
+        self.prefix_prompt = prefix_prompt
 
     def __len__(self):
         return len(self.samples)
@@ -67,8 +72,36 @@ class AugmentedDataset(Dataset):
         text = sample['text']
         difficulty = sample['difficulty']
         
-        encoding = self.tokenizer.encode_plus(
-            text,
+        # 构建用户内容：如果有prefix_prompt，添加到文本前面
+        user_content = text
+        if self.prefix_prompt:
+            user_content = self.prefix_prompt + "\n" + text
+        
+        # 使用模型的chat template格式化文本
+        messages = []
+        
+        # 如果有system_prompt，添加系统消息
+        if self.system_prompt:
+            messages.append({"role": "system", "content": self.system_prompt})
+        
+        # 添加用户消息
+        messages.append({"role": "user", "content": user_content})
+        
+        # 应用chat template
+        try:
+            formatted_text = self.tokenizer.apply_chat_template(
+                messages, 
+                tokenize=False, 
+                add_generation_prompt=False
+            )
+        except Exception as e:
+            # 如果模型没有chat template，直接使用原文本
+            print(f"Warning: Failed to apply chat template: {e}. Using raw text.")
+            formatted_text = user_content
+        
+        # Tokenize
+        encoding = self.tokenizer(
+            formatted_text,
             add_special_tokens=True,
             max_length=self.max_length,
             padding='max_length',
@@ -102,29 +135,101 @@ def load_data(file_path, training_target, answer_keys=None):
     
     return questions, answers_lists, difficulties
 
-# 3. 简化的Transformer回归模型
-class SimpleTransformerRegressor(nn.Module):
-    def __init__(self, model_name='bert-base-uncased', dropout=0.3, cache_dir=None):
-        super(SimpleTransformerRegressor, self).__init__()
+# 3. Decoder-Only Transformer回归模型
+class DecoderOnlyRegressor(nn.Module):
+    def __init__(self, model_name='Qwen/Qwen2.5-0.5B', dropout=0.3, cache_dir=None, freeze_layers=None):
+        super(DecoderOnlyRegressor, self).__init__()
         self.model_name = model_name
-        self.transformer = AutoModel.from_pretrained(model_name, cache_dir=cache_dir)
+        self.freeze_layers = freeze_layers
+        
+        # 加载decoder-only模型
+        self.transformer = AutoModelForCausalLM.from_pretrained(
+            model_name, 
+            cache_dir=cache_dir,
+            torch_dtype=torch.float32,  # 或使用 torch.bfloat16/torch.float16 以节省显存
+            trust_remote_code=True  # Qwen模型需要这个参数
+        )
+        
+        # 设置为不生成文本，只获取hidden states
+        self.transformer.config.output_hidden_states = True
+        
+        # 冻结层
+        if freeze_layers is not None and freeze_layers > 0:
+            self._freeze_layers(freeze_layers)
+        
         hidden_size = self.transformer.config.hidden_size
         self.dropout = nn.Dropout(dropout)
         self.regressor = nn.Linear(hidden_size, 1)
 
+    def _freeze_layers(self, freeze_layers):
+        """
+        冻结除了最后 freeze_layers 层之外的所有层
+        """
+        # 获取模型的层数
+        if hasattr(self.transformer.model, 'layers'):
+            # Qwen/Llama 等模型
+            layers = self.transformer.model.layers
+        elif hasattr(self.transformer.transformer, 'h'):
+            # GPT-2 风格
+            layers = self.transformer.transformer.h
+        else:
+            print("Warning: Could not identify model layers. Skipping layer freezing.")
+            return
+        
+        total_layers = len(layers)
+        layers_to_freeze = total_layers - freeze_layers
+        
+        if layers_to_freeze <= 0:
+            print(f"freeze_layers={freeze_layers} >= total_layers={total_layers}. No layers will be frozen.")
+            return
+        
+        print(f"\nFreezing layers:")
+        print(f"  Total layers: {total_layers}")
+        print(f"  Layers to freeze: {layers_to_freeze} (layer 0 to {layers_to_freeze-1})")
+        print(f"  Layers to train: {freeze_layers} (layer {layers_to_freeze} to {total_layers-1})")
+        
+        # 冻结 embedding 层
+        if hasattr(self.transformer.model, 'embed_tokens'):
+            for param in self.transformer.model.embed_tokens.parameters():
+                param.requires_grad = False
+            print("  ✓ Frozen: Embedding layer")
+        
+        # 冻结指定数量的 transformer 层
+        frozen_count = 0
+        for i in range(layers_to_freeze):
+            for param in layers[i].parameters():
+                param.requires_grad = False
+            frozen_count += 1
+        
+        print(f"  ✓ Frozen: {frozen_count} transformer layers")
+        
+        # 统计可训练参数
+        trainable_params = sum(p.numel() for p in self.transformer.parameters() if p.requires_grad)
+        total_params = sum(p.numel() for p in self.transformer.parameters())
+        print(f"  Trainable parameters: {trainable_params:,} / {total_params:,} ({100*trainable_params/total_params:.2f}%)")
+
     def forward(self, input_ids, attention_mask):
+        # 获取模型输出，包含所有层的hidden states
         outputs = self.transformer(
             input_ids=input_ids,
-            attention_mask=attention_mask
+            attention_mask=attention_mask,
+            output_hidden_states=True,
+            return_dict=True
         )
         
-        # Mean pooling
-        last_hidden = outputs.last_hidden_state
-        mask = attention_mask.unsqueeze(-1).float()
-        summed = (last_hidden * mask).sum(dim=1)
-        denom = mask.sum(dim=1).clamp(min=1e-6)
-        pooled_output = summed / denom
+        # 获取最后一层的hidden states
+        # hidden_states是一个tuple，包含所有层的输出
+        # [-1]表示最后一层
+        last_hidden_state = outputs.hidden_states[-1]  # shape: [batch_size, seq_len, hidden_size]
         
+        # Average pooling - 只对有效token做平均
+        # attention_mask: [batch_size, seq_len]
+        mask = attention_mask.unsqueeze(-1).float()  # [batch_size, seq_len, 1]
+        summed = (last_hidden_state * mask).sum(dim=1)  # [batch_size, hidden_size]
+        denom = mask.sum(dim=1).clamp(min=1e-6)  # [batch_size, 1]
+        pooled_output = summed / denom  # [batch_size, hidden_size]
+        
+        # 回归层
         output = self.dropout(pooled_output)
         output = self.regressor(output)
         
@@ -275,7 +380,7 @@ def eval_model(model, dataloader, device, criterion, scaler=None):
 
 # 6. 参数解析
 def parse_args():
-    parser = argparse.ArgumentParser(description='Data Augmentation Transformer Difficulty Regression')
+    parser = argparse.ArgumentParser(description='Decoder-Only Model Difficulty Regression')
     parser.add_argument('--train_file', type=str, default='Cambridge_train.json')
     parser.add_argument('--val_file', type=str, default=None)
     parser.add_argument('--test_file', type=str, default='Cambridge_test.json')
@@ -283,11 +388,24 @@ def parse_args():
     parser.add_argument('--training_target', type=str, default='difficulty')
     parser.add_argument('--answer_keys', type=str, nargs='+', default=[], 
                         help='A list of keys for the answers to include from the JSON file (e.g., --answer_keys answer1 answer2)')
-    parser.add_argument('--model_name', type=str, default='bert-base-uncased')
+    
+    # Prompt arguments
+    parser.add_argument('--system_prompt', type=str, default=None,
+                        help='System prompt to add to chat template')
+    parser.add_argument('--prefix_prompt', type=str, default=None,
+                        help='Prefix to add before user content in chat template')
+    
+    # Model arguments
+    parser.add_argument('--model_name', type=str, default='Qwen/Qwen2.5-0.5B',
+                        help='Model name (e.g., Qwen/Qwen2.5-0.5B, Qwen/Qwen2.5-1.5B, meta-llama/Llama-3.2-1B)')
+    parser.add_argument('--freeze_layers', type=int, default=None,
+                        help='Number of last layers to keep trainable (freeze all other layers). E.g., --freeze_layers 4 freezes all but last 4 layers')
     parser.add_argument('--max_length', type=int, default=512)
     parser.add_argument('--dropout', type=float, default=0.3)
-    parser.add_argument('--batch_size', type=int, default=8)
-    parser.add_argument('--gradient_accumulation_steps', type=int, default=1,
+    
+    # Training arguments
+    parser.add_argument('--batch_size', type=int, default=4)
+    parser.add_argument('--gradient_accumulation_steps', type=int, default=2,
                         help='Number of gradient accumulation steps')
     parser.add_argument('--epochs', type=int, default=5)
     parser.add_argument('--lr', type=float, default=2e-5)
@@ -298,12 +416,18 @@ def parse_args():
                         help='Run evaluation every X steps')
     parser.add_argument('--log_steps', type=int, default=10,
                         help='Log training info every X steps')
+    
+    # Other arguments
     parser.add_argument('--seed', type=int, default=42)
-    parser.add_argument('--output_dir', type=str, default='./output_augmented')
-    parser.add_argument('--save_model', type=str, default='best_model_augmented.pt')
+    parser.add_argument('--output_dir', type=str, default='./output_decoder')
+    parser.add_argument('--save_model', type=str, default='best_model_decoder.pt')
     parser.add_argument('--normalize', action='store_true')
     parser.add_argument('--cache_dir', type=str, default='/nfshomes/minglii/scratch/cache/hub')
     parser.add_argument('--log_file', type=str, default=None)
+    parser.add_argument('--use_fp16', action='store_true', 
+                        help='Use mixed precision training (fp16)')
+    parser.add_argument('--use_bf16', action='store_true',
+                        help='Use mixed precision training (bf16)')
     
     return parser.parse_args()
 
@@ -324,7 +448,7 @@ def main():
     os.makedirs(args.output_dir, exist_ok=True)
 
     timestamp = datetime.datetime.now().strftime('%Y%m%d_%H%M%S')
-    default_log = os.path.join(args.output_dir, f'train_augmented_{timestamp}.log')
+    default_log = os.path.join(args.output_dir, f'train_decoder_{timestamp}.log')
     log_path = args.log_file if args.log_file is not None else default_log
     
     if os.path.exists(log_path):
@@ -341,6 +465,15 @@ def main():
     for arg, value in vars(args).items():
         print(f"  {arg}: {value}")
     print("=" * 50)
+    
+    # 打印 prompt 信息
+    if args.system_prompt or args.prefix_prompt:
+        print("\nPrompt Configuration:")
+        if args.system_prompt:
+            print(f"  System Prompt: {args.system_prompt}")
+        if args.prefix_prompt:
+            print(f"  Prefix Prompt: {args.prefix_prompt}")
+        print("-" * 50)
     
     print("\nLoading data...")
     train_questions, train_answers, train_difficulties = load_data(args.train_file, args.training_target, args.answer_keys)
@@ -375,12 +508,30 @@ def main():
         print(f"  Normalization applied. Mean: {scaler.mean_[0]:.4f}, Std: {scaler.scale_[0]:.4f}")
     
     print(f"\nLoading tokenizer: {args.model_name}")
-    tokenizer = AutoTokenizer.from_pretrained(args.model_name, cache_dir=args.cache_dir)
+    tokenizer = AutoTokenizer.from_pretrained(
+        args.model_name, 
+        cache_dir=args.cache_dir,
+        trust_remote_code=True
+    )
+    
+    # 设置padding token（decoder-only模型通常需要）
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
+        print(f"Set pad_token to eos_token: {tokenizer.eos_token}")
     
     # 创建数据增强后的数据集
-    train_dataset = AugmentedDataset(train_questions, train_answers, train_difficulties, tokenizer, args.max_length)
-    val_dataset = AugmentedDataset(val_questions, val_answers, val_difficulties, tokenizer, args.max_length)
-    test_dataset = AugmentedDataset(test_questions, test_answers, test_difficulties, tokenizer, args.max_length)
+    train_dataset = AugmentedDataset(
+        train_questions, train_answers, train_difficulties, tokenizer, args.max_length,
+        system_prompt=args.system_prompt, prefix_prompt=args.prefix_prompt
+    )
+    val_dataset = AugmentedDataset(
+        val_questions, val_answers, val_difficulties, tokenizer, args.max_length,
+        system_prompt=args.system_prompt, prefix_prompt=args.prefix_prompt
+    )
+    test_dataset = AugmentedDataset(
+        test_questions, test_answers, test_difficulties, tokenizer, args.max_length,
+        system_prompt=args.system_prompt, prefix_prompt=args.prefix_prompt
+    )
     
     print(f"\nAfter data augmentation:")
     print(f"  Train: {len(train_questions)} questions -> {len(train_dataset)} samples (augmentation factor: {len(train_dataset)/len(train_questions):.2f}x)")
@@ -394,11 +545,16 @@ def main():
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f"Using device: {device}")
     
-    model = SimpleTransformerRegressor(
+    print(f"\nLoading model: {args.model_name}")
+    model = DecoderOnlyRegressor(
         model_name=args.model_name, 
         dropout=args.dropout, 
-        cache_dir=args.cache_dir
+        cache_dir=args.cache_dir,
+        freeze_layers=args.freeze_layers
     ).to(device)
+    
+    print(f"Model loaded. Hidden size: {model.transformer.config.hidden_size}")
+    print(f"Number of parameters: {sum(p.numel() for p in model.parameters()):,}")
     
     optimizer = AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
     criterion = nn.MSELoss()
@@ -434,6 +590,10 @@ def main():
     print(f'  R²: {test_r2:.4f}')
     
     results = {
+        'model_name': args.model_name,
+        'freeze_layers': args.freeze_layers,
+        'system_prompt': args.system_prompt,
+        'prefix_prompt': args.prefix_prompt,
         'test_mse': float(test_mse),
         'test_mae': float(test_mae),
         'test_rmse': float(test_rmse),
