@@ -30,6 +30,8 @@ def main():
                         help='System prompt to use for the conversation (optional)')
     parser.add_argument('--prefix_prompt', type=str, default=None,
                         help='Prefix prompt to prepend to the user prompt (optional)')
+    parser.add_argument('--reasoning', action='store_true',
+                        help='Enable reasoning mode - retry inference until response contains </think> tag')
 
     args = parser.parse_args()
 
@@ -55,50 +57,81 @@ def main():
     def run_inference(prompt: str) -> str:
         """
         Generate a response for the given prompt using the loaded model.
+        In reasoning mode, retry until response contains </think> tag.
         """
-        # Build the user prompt with prefix if provided
-        user_content = prompt
-        if args.prefix_prompt:
-            user_content = args.prefix_prompt + prompt
+        max_retries = 10  # Maximum number of retries for reasoning mode
+        retry_count = 0
         
-        # Build messages array
-        messages = []
+        while retry_count < max_retries:
+            # Build the user prompt with prefix if provided
+            user_content = prompt
+            if args.prefix_prompt:
+                user_content = args.prefix_prompt + prompt
+            
+            # Build messages array
+            messages = []
+            
+            # Add system prompt if provided
+            if args.system_prompt:
+                messages.append({"role": "system", "content": args.system_prompt})
+            
+            # Add user message
+            messages.append({"role": "user", "content": user_content})
+            
+            if 'Qwen3' in args.model_name:
+                if args.reasoning:
+                    text = tokenizer.apply_chat_template(
+                        messages,
+                        tokenize=False,
+                        add_generation_prompt=True,
+                        enable_thinking=True
+                    )
+                else:
+                    text = tokenizer.apply_chat_template(
+                        messages,
+                        tokenize=False,
+                        add_generation_prompt=True,
+                        enable_thinking=False
+                    )
+            else:
+                text = tokenizer.apply_chat_template(
+                    messages,
+                    tokenize=False,
+                    add_generation_prompt=True
+                )
+
+            inputs = tokenizer(text, return_tensors="pt").to(model.device)
+
+            # Generate
+            with torch.no_grad():
+                generated_ids = model.generate(
+                    **inputs,
+                    max_new_tokens=args.max_new_tokens,
+                )
+
+            # Extract only the newly generated tokens (beyond the prompt)
+            new_tokens = generated_ids[0][len(inputs["input_ids"][0]):]
+
+            # Decode
+            response_text = tokenizer.decode(new_tokens, skip_special_tokens=True)
+            
+            # Check if reasoning mode is enabled and response contains </think> tag
+            if args.reasoning:
+                if '</think>' in response_text:
+                    print(f"Reasoning mode: Successfully generated response with </think> tag (attempt {retry_count + 1})")
+                    return response_text
+                else:
+                    retry_count += 1
+                    print(f"Reasoning mode: Response missing </think> tag, retrying... (attempt {retry_count}/{max_retries})")
+                    continue
+            else:
+                # Non-reasoning mode, return immediately
+                return response_text
         
-        # Add system prompt if provided
-        if args.system_prompt:
-            messages.append({"role": "system", "content": args.system_prompt})
+        # If we've exhausted all retries in reasoning mode
+        if args.reasoning and retry_count >= max_retries:
+            print(f"Warning: Reasoning mode failed to generate response with </think> tag after {max_retries} attempts. Returning last response.")
         
-        # Add user message
-        messages.append({"role": "user", "content": user_content})
-        
-        if 'Qwen3' in args.model_name:
-            text = tokenizer.apply_chat_template(
-                messages,
-                tokenize=False,
-                add_generation_prompt=True,
-                enable_thinking=True
-            )
-        else:
-            text = tokenizer.apply_chat_template(
-                messages,
-                tokenize=False,
-                add_generation_prompt=True
-            )
-
-        inputs = tokenizer(text, return_tensors="pt").to(model.device)
-
-        # Generate
-        with torch.no_grad():
-            generated_ids = model.generate(
-                **inputs,
-                max_new_tokens=args.max_new_tokens,
-            )
-
-        # Extract only the newly generated tokens (beyond the prompt)
-        new_tokens = generated_ids[0][len(inputs["input_ids"][0]):]
-
-        # Decode
-        response_text = tokenizer.decode(new_tokens, skip_special_tokens=True)
         return response_text
 
     # Ensure output has the correct .jsonl extension
